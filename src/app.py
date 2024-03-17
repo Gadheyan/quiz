@@ -1,13 +1,22 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, make_response
 from flask_sqlalchemy import SQLAlchemy
+from flask_caching import Cache
 import random
+from datetime import datetime
+from functools import wraps
+
 
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///app.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['CACHE_TYPE'] = 'redis'
+app.config['CACHE_REDIS_URL'] = 'redis://redis:6379/0'
+app.config['CACHE_KEY_PREFIX'] = 'quiz_cache'
 
+TIMEOUT_IN_SECONDS = 10
+CACHE_INDICATOR_HEADER="x-now-cache"
 db = SQLAlchemy(app)
-
+cache = Cache(app)
 
 
 # Models For The Quiz App
@@ -23,37 +32,30 @@ class Option(db.Model):
     question_id = db.Column(db.Integer, db.ForeignKey('question.id'), nullable=False)
 
 
-with app.app_context():
-    print("Creating tables...")
-    db.create_all()
-    print("Created tables...")
-    
-@app.route("/", methods=['GET'])
+def add_cache_headers(f):
+    wraps(f)
+    def decorated_function(*args, **kwargs):
+        cache_key = f"view/{request.path}"
+        cache_status = 'Hit' if cache.cache.has(cache_key) else 'Miss'
+        print(dir(cache.memoize))
+        cached_function = cache.cached(timeout=TIMEOUT_IN_SECONDS)(f)
+        response = cached_function(*args, **kwargs)
+        response.headers[CACHE_INDICATOR_HEADER] = cache_status
+        return response
+    return decorated_function
+
+
+@app.route("/home", methods=['GET'])
+@add_cache_headers
 def hello_world():
-    return "<p>Hlo, World!</p>."
+    response = {'message': "Hello World"}
+    return jsonify(response)
 
 
 @app.route('/questions', methods=['POST'])
 def add_question():
     """
     Add a new multiple-choice question to the quiz.
-
-    Request JSON format:
-    {
-        "text": "Question text?",
-        "answer": 1,
-        "options": [
-            {"text": "Option A", "is_correct": true},
-            {"text": "Option B", "is_correct": false},
-            {"text": "Option C", "is_correct": false},
-            {"text": "Option D", "is_correct": false}
-        ]
-    }
-
-    Response JSON format:
-    {"message": "Question added successfully"}
-
-    The 'answer' field represents the correct option's index (0-indexed) in the 'options' array.
     """
     questions = request.json
 
@@ -68,32 +70,13 @@ def add_question():
 
         db.session.add(new_question)
         db.session.commit()
-    return jsonify({'message': 'Question added successfully'}), 201
+    return jsonify({'message': 'Question(s) added successfully'}), 201
 
-@app.route('/quiz', methods=['GET'])
+@app.route('/quiz', methods=['GET'], endpoint='generate_quiz')
+@add_cache_headers
 def generate_quiz():
     """
     Generate a quiz with random multiple-choice questions.
-
-    Query parameters:
-    - num_questions (optional): Number of questions to include in the quiz (default is 5).
-
-    Response JSON format:
-    {
-        "quiz": [
-            {
-                "id": 1,
-                "text": "Question text?",
-                "options": [
-                    {"id": 1, "text": "Option A"},
-                    {"id": 2, "text": "Option B"},
-                    {"id": 3, "text": "Option C"},
-                    {"id": 4, "text": "Option D"}
-                ]
-            },
-            ...
-        ]
-    }
     """
     questions = Question.query.all()
     if not questions:
@@ -103,26 +86,13 @@ def generate_quiz():
     selected_questions = random.sample(questions, num_questions)
 
     quiz = [{'id': question.id, 'text': question.text, 'options': [{'id': option.id, 'text': option.text} for option in question.options]} for question in selected_questions]
-    return jsonify({'quiz': quiz})
+    response = {'quiz': quiz}
+    return jsonify(response)
 
 @app.route('/verify', methods=['POST'])
 def verify_answer():
     """
     Verify the selected answer for a question in the quiz.
-
-    Request JSON format:
-    {
-        "question_id": 1,
-        "selected_option_id": 2
-    }
-
-    Response JSON format:
-    {
-        "is_correct": true,
-        "correct_option_id": 2
-    }
-
-    The 'selected_option_id' represents the index (0-indexed) of the selected option in the 'options' array.
     """
     data = request.json
     question_id = data['question_id']
@@ -140,3 +110,5 @@ def verify_answer():
         return jsonify({'is_correct': False, 'correct_option_id': correct_option_id})
 
 
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", debug=True)
